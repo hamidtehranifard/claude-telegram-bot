@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram bridge to Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=claude
+WorkingDirectory=/home/claude/bot
+EnvironmentFile=/home/claude/bot/.env
+ExecStart=/usr/bin/python3 -u /home/claude/bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

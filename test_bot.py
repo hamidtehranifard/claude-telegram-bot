@@ -25,4 +25,12 @@ assert url.startswith("https://claude.com/cai/oauth/authorize?code=true&client_i
 fake = "sk-ant-" + "oat01-" + "FAKE" * 6  # built in pieces so secret scanners don't flag test data
 tok = re.search(r"sk-ant-oat\w*-[A-Za-z0-9_\-]{20,}", bot.clean(b"Your token:\r\n" + fake.encode() + b"\r\n")).group(0)
 assert tok == fake, tok
+
+# blocked actions -> narrow allow rules for the approval card
+rules = dict(bot.denial_rules([
+    {"tool_name": "Bash", "tool_input": {"command": "cd x && LANG=C curl -s https://a.b | /usr/bin/jq . ; wget y"}},
+    {"tool_name": "Write", "tool_input": {"file_path": "/etc/hosts"}},
+]))
+assert set(rules) == {"Bash(cd:*)", "Bash(curl:*)", "Bash(jq:*)", "Bash(wget:*)", "Write"}, rules
+assert "/etc/hosts" in rules["Write"]
 print("ok")

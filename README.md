@@ -47,6 +47,10 @@ cd ~/bot && TG_TOKEN=x ALLOWED_ID=1 python3 test_bot.py   # prints "ok"
   - admin: web search, web fetch, **any shell command**, and file edits in the work folder.
   - friends and guest: web search, web fetch, and file edits in their own folder. **No Bash**, so they can't read
     `.env` or other users' tokens (tested: reads outside the working folder are blocked).
-  - Denied tools are listed under the reply (⛔).
+  - Claude is told to use WebSearch/WebFetch (not curl) for the web, so search works for everyone.
+  - **Approvals from Telegram**: when Claude is blocked, the admin gets a card with the exact command and
+    `✅ once` / `✅ always` / `❌ no`. Approving resumes the same conversation with a narrow rule
+    (e.g. `Bash(curl:*)` allows curl but not wget). Friends can't approve their own requests, because
+    a shell command could read the bot's secrets. `🔐` lists and deletes saved "always" rules.
 - Messages from one user run one at a time. Each user has their own queue.
 - Gemini free tier: Google may use the audio to improve its products.

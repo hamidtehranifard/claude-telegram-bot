@@ -16,9 +16,11 @@ TZ = ZoneInfo("Asia/Tehran")
 
 NEW_BTN, LIST_BTN, USAGE_BTN = "🆕 گفتگوی جدید", "📋 گفتگوها", "📊 مصرف"
 ADD_BTN, GUEST_BTN, DEL_BTN = "➕ افزودن دوست", "👥 افزودن مهمان", "➖ حذف دوست"
+PERM_BTN = "🔐 دسترسی‌ها"
 BASE_ROW = [{"text": NEW_BTN}, {"text": LIST_BTN}, {"text": USAGE_BTN}]
 KB_FRIEND = json.dumps({"keyboard": [BASE_ROW], "resize_keyboard": True, "is_persistent": True})
-KB_ADMIN = json.dumps({"keyboard": [BASE_ROW, [{"text": ADD_BTN}, {"text": GUEST_BTN}, {"text": DEL_BTN}]],
+KB_ADMIN = json.dumps({"keyboard": [BASE_ROW, [{"text": ADD_BTN}, {"text": GUEST_BTN}, {"text": DEL_BTN}],
+                                    [{"text": PERM_BTN}]],
                        "resize_keyboard": True, "is_persistent": True})
 
 
@@ -128,6 +130,10 @@ class User:
             return
         if kind == "login":
             return self.start_login()
+        if kind == "approve":
+            return self.approved(*payload)
+        if kind == "denied":
+            return send(self.uid, "❌ اجازه داده نشد.")
         m = payload
         text = m.get("text") or m.get("caption") or ""
         cmd = text.strip()
@@ -157,11 +163,15 @@ class User:
             return send(self.uid, "آماده‌ام. پیام یا فایل بفرستید. با دکمه‌های پایین گفتگوی تازه بسازید یا گفتگوی قبلی را انتخاب کنید.")
         if not text:
             return
+        self.run(text, voice=bool(m.get("voice")))
+
+    def run(self, text, extra=(), voice=False):
         call("sendChatAction", chat_id=self.uid, action="typing")
-        reply, self.current = ask(text, self.current, self.workdir, self.env(),
-                                  TOOLS_ADMIN if self.admin else TOOLS_OTHERS)
-        # spoken in -> spoken out (voice only); long replies, errors or a TTS failure -> text
-        if (m.get("voice") and GEMINI_KEY and len(reply) <= TTS_MAX_CHARS
+        tools = (TOOLS_ADMIN if self.admin else TOOLS_OTHERS) + saved_rules(self.uid) + list(extra)
+        reply, self.current, denials = ask(text, self.current, self.workdir, self.env(), tools)
+        rules = denial_rules(denials)
+        # spoken in -> spoken out (voice only); long replies, errors, permission requests or a TTS failure -> text
+        if (voice and GEMINI_KEY and not rules and len(reply) <= TTS_MAX_CHARS
                 and not reply.startswith(("⚠️", "⏱"))):
             call("sendChatAction", chat_id=self.uid, action="record_voice")
             try:
@@ -169,6 +179,38 @@ class User:
             except Exception as e:
                 print(f"user {self.uid} tts error:", e, flush=True)
         send(self.uid, reply)
+        if rules:
+            self.request(rules)
+
+    def request(self, rules):
+        """Blocked actions -> approval card for the admin (friends can't approve their own: no isolation)."""
+        rid = os.urandom(4).hex()
+        with pending_lock:
+            PENDING[rid] = {"uid": self.uid, "rules": rules, "sid": self.current}
+        lines = "\n".join("• " + desc for _, desc in rules)
+        warn = ""
+        if not self.admin and any(r.startswith("Bash") for r, _ in rules):
+            warn = ("\n\n⚠️ این کاربر با همان کاربر لینوکسی بات اجرا می‌شود. دستور شل می‌تواند توکن بات، "
+                    "کلید Gemini و توکن دوستان را بخواند. فقط اگر به او اعتماد دارید تأیید کنید.")
+        kb = json.dumps({"inline_keyboard": [
+            [{"text": "✅ فقط این بار", "callback_data": "p1:" + rid}, {"text": "✅ همیشه", "callback_data": "pA:" + rid}],
+            [{"text": "❌ نه", "callback_data": "pN:" + rid}]]})
+        send(ADMIN, f"🔐 درخواست دسترسی از {user_label(self.uid)}:\n{lines}{warn}", kb)
+        if not self.admin:
+            send(self.uid, "⏳ این کار اجازه می‌خواهد. درخواست برای ادمین فرستاده شد.")
+
+    def approved(self, req, always):
+        rules = [r for r, _ in req["rules"]]
+        if always:
+            with store_lock:
+                mine = STORE.setdefault("perms", {}).setdefault(str(self.uid), [])
+                mine += [r for r in rules if r not in mine]
+                save_store()
+        self.current = req["sid"]  # continue the conversation that asked
+        send(self.uid, "✅ اجازه داده شد. ادامه می‌دهم…")
+        descs = "; ".join(d for _, d in req["rules"])
+        self.run(f"The user has now approved the previously blocked action(s): {descs}. "
+                 "Retry them and finish the original task.", extra=rules)
 
     def show_list(self):
         rows = []
@@ -365,27 +407,65 @@ def save_upload(m, workdir):
 # Tool access per role (tested 2026-10-07). acceptEdits = create/edit files inside the working folder.
 # Without "Bash", claude -p still runs read-only commands but only inside its working folder, so
 # friends/guest can't read ~/bot/.env or users.json. "Bash" = any command as the claude user: admin only.
-TOOLS_ADMIN = "WebSearch,WebFetch,Bash"
-TOOLS_OTHERS = "WebSearch,WebFetch"
+TOOLS_ADMIN = ["WebSearch", "WebFetch", "Bash"]
+TOOLS_OTHERS = ["WebSearch", "WebFetch"]
+SEARCH_HINT = "For web search and reading web pages, use the WebSearch and WebFetch tools, not curl or wget."
+
+
+def denial_rules(denials):
+    """permission_denials -> [(rule, human description)]. Bash gets one prefix rule per command word
+    (e.g. 'Bash(curl:*)' allows curl but not wget); other tools are allowed as a whole."""
+    out = {}
+    for d in denials:
+        tool, inp = d.get("tool_name", "?"), d.get("tool_input") or {}
+        if tool == "Bash":
+            cmd = inp.get("command", "")
+            for part in re.split(r"&&|\|\||[;|\n]", cmd):
+                words = [w for w in part.split() if "=" not in w.split("/")[0]]  # skip VAR=x prefixes
+                if words:
+                    word = os.path.basename(words[0])
+                    out[f"Bash({word}:*)"] = f"دستور شل {word}: {cmd[:120]}"
+        else:
+            target = inp.get("file_path") or inp.get("url") or inp.get("path") or ""
+            out[tool] = f"ابزار {tool}" + (f": {target[:120]}" if target else "")
+    return list(out.items())
 
 
 def ask(prompt, sid, workdir, env, tools=TOOLS_OTHERS):
-    """Run claude; return (reply, session_id). sid=None starts a new session."""
+    """Run claude; return (reply, session_id, permission_denials). sid=None starts a new session."""
     args = [CLAUDE, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-            "--allowedTools", tools] + (["--resume", sid] if sid else [])
+            "--append-system-prompt", SEARCH_HINT,
+            "--allowedTools", ",".join(tools)] + (["--resume", sid] if sid else [])
     try:
         p = subprocess.run(args, cwd=workdir, env=env, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
-        return "⏱ Claude did not answer within 15 minutes.", sid
+        return "⏱ Claude did not answer within 15 minutes.", sid, []
     try:
         d = json.loads(p.stdout)
     except ValueError:  # auth expiry, crash, etc.: no JSON, show raw error
-        return f"⚠️ claude exited {p.returncode}:\n{(p.stderr or p.stdout)[-1500:]}", sid
+        return f"⚠️ claude exited {p.returncode}:\n{(p.stderr or p.stdout)[-1500:]}", sid, []
     reply = d.get("result") or ""
-    denied = sorted({p.get("tool_name", "?") for p in d.get("permission_denials") or []})
-    if denied and not d.get("is_error"):
-        reply += "\n\n⛔ اجازه نداشت: " + "، ".join(denied)
-    return (f"⚠️ {reply}" if d.get("is_error") else reply), d.get("session_id") or sid
+    if d.get("is_error"):
+        return f"⚠️ {reply}", d.get("session_id") or sid, []
+    return reply, d.get("session_id") or sid, d.get("permission_denials") or []
+
+
+# ---------- permission requests (approved by the admin from Telegram) ----------
+
+PENDING = {}  # request id -> dict(uid, rules, sid)
+pending_lock = threading.Lock()
+
+
+def user_label(uid):
+    if uid == ADMIN:
+        return "شما"
+    if (STORE.get("guest") or {}).get("id") == uid:
+        return "مهمان " + STORE["guest"]["name"]
+    return (STORE["friends"].get(str(uid)) or {}).get("name", str(uid))
+
+
+def saved_rules(uid):
+    return list((STORE.get("perms") or {}).get(str(uid), []))
 
 
 JMONTHS = ["فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
@@ -474,6 +554,8 @@ def main():
                     elif uid == ADMIN and data == "g:":
                         with store_lock:
                             g = store.pop("guest", None)
+                            if g and g.get("id"):
+                                store.get("perms", {}).pop(str(g["id"]), None)
                             save_store()
                         if g and g.get("id"):
                             users.pop(g["id"], None)
@@ -484,6 +566,7 @@ def main():
                         fid = data[2:]
                         with store_lock:
                             f = store["friends"].pop(fid, None)
+                            store.get("perms", {}).pop(fid, None)
                             save_store()
                         if f:
                             gone = users.pop(int(fid), None)
@@ -491,6 +574,34 @@ def main():
                                 gone.kill_login()
                             shutil.rmtree(os.path.join(HOME, "friends", fid), ignore_errors=True)
                             send(ADMIN, f"🗑 {f.get('name', fid)} حذف شد و توکن و فایل‌هایش پاک شد.")
+                    elif uid == ADMIN and data[:3] in ("p1:", "pA:", "pN:"):  # approval card
+                        with pending_lock:
+                            req = PENDING.pop(data[3:], None)
+                        msg = q.get("message") or {}
+                        if not req or req["uid"] not in users:
+                            status = "⌛ این درخواست دیگر معتبر نیست."
+                        elif data[:2] == "pN":
+                            users[req["uid"]].q.put(("denied", None))
+                            status = "❌ رد شد."
+                        else:
+                            always = data[:2] == "pA"
+                            users[req["uid"]].q.put(("approve", (req, always)))
+                            status = "✅ تأیید شد" + (" (همیشه)." if always else " (فقط این بار).")
+                        try:  # replace the buttons with the decision, so it can't be pressed twice
+                            call("editMessageText", chat_id=ADMIN, message_id=msg.get("message_id"),
+                                 text=(msg.get("text") or "") + "\n\n" + status)
+                        except Exception:
+                            send(ADMIN, status)
+                    elif uid == ADMIN and data.startswith("pr:"):  # delete a saved rule
+                        _, ruid, idx, head = data.split(":", 3)
+                        rule = None
+                        with store_lock:  # index + name prefix must both match, so a stale button can't delete the wrong rule
+                            rules = store.get("perms", {}).get(ruid, [])
+                            if idx.isdigit() and int(idx) < len(rules) and rules[int(idx)][:30] == head:
+                                rule = rules.pop(int(idx))
+                                save_store()
+                        send(ADMIN, f"🗑 قاعده‌ی {rule} برای {user_label(int(ruid))} پاک شد." if rule
+                             else "⚠️ این قاعده پیدا نشد. دوباره دکمه‌ی 🔐 را بزنید.")
                     continue
 
                 m = u.get("message") or {}
@@ -511,6 +622,18 @@ def main():
                             continue
                         awaiting = "guest"
                         send(ADMIN, "یوزرنیم تلگرام مهمان را بفرستید (مثلاً @ali).\n⚠️ او با حساب Claude شما کار می‌کند و از سهمیه‌ی شما مصرف می‌کند.")
+                        continue
+                    if cmd in ("/perms", PERM_BTN):
+                        awaiting = None
+                        rows = [[{"text": f"❌ {user_label(int(ruid))}: {rule}", "callback_data": f"pr:{ruid}:{i}:{rule[:30]}"}]
+                                for ruid, rules in store.get("perms", {}).items() for i, rule in enumerate(rules)]
+                        base = ("دسترسی پایه:\n• شما: جست‌وجو، خواندن وب، هر دستور شل، ویرایش فایل در پوشه‌ی کاری\n"
+                                "• دوستان و مهمان: جست‌وجو، خواندن وب، ویرایش فایل در پوشه‌ی خودشان")
+                        if rows:
+                            send(ADMIN, base + "\n\nقاعده‌های «همیشه» (برای پاک کردن، روی هر کدام بزنید):",
+                                 json.dumps({"inline_keyboard": rows}))
+                        else:
+                            send(ADMIN, base + "\n\nهنوز قاعده‌ی «همیشه» ثبت نشده.")
                         continue
                     if awaiting and cmd and (cmd.startswith("/") or cmd in (NEW_BTN, LIST_BTN, USAGE_BTN, DEL_BTN, GUEST_BTN, ADD_BTN)):
                         awaiting = None  # admin moved on: cancel, handle the command normally

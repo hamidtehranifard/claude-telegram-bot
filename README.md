@@ -11,7 +11,7 @@ Single file, **Python standard library only** (no pip packages).
 - 🆕 New conversation · 📋 list and pick earlier conversations · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
 - File and photo upload (≤ 20 MB, a Telegram bot limit): Claude reads them from `work/uploads/`.
 - 🎤 Voice messages: Persian speech-to-text with Google Gemini (free tier), then sent to Claude.
-- 🔊 Voice in, voice out: the reply is also read aloud (Gemini TTS, converted to Opus with `ffmpeg`).
+- 🔊 Voice in, voice out: a voice message gets a voice reply only (Gemini TTS, Opus via `ffmpeg`); long replies (>1500 chars) come as text.
 - Multi-user, admin only:
   - ➕ **Friend**: logs in with *their own* Claude subscription. The bot runs `claude setup-token` in a pty, sends them the login link, and takes the code back. Separate config dir, history, and queue.
   - 👥 **Guest** (max 1): uses the admin's account, in a separate folder. ⚠️ Sharing an account goes against Anthropic's consumer terms, so use it at your own risk.

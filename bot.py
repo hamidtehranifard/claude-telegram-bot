@@ -159,16 +159,15 @@ class User:
             return
         call("sendChatAction", chat_id=self.uid, action="typing")
         reply, self.current = ask(text, self.current, self.workdir, self.env())
-        send(self.uid, reply)
-        if m.get("voice") and GEMINI_KEY and not reply.startswith(("⚠️", "⏱")):  # spoken in -> spoken out
-            if len(reply) > TTS_MAX_CHARS:
-                return send(self.uid, "🔇 جواب طولانی بود، فقط متن فرستاده شد.")
+        # spoken in -> spoken out (voice only); long replies, errors or a TTS failure -> text
+        if (m.get("voice") and GEMINI_KEY and len(reply) <= TTS_MAX_CHARS
+                and not reply.startswith(("⚠️", "⏱"))):
             call("sendChatAction", chat_id=self.uid, action="record_voice")
             try:
-                send_voice(self.uid, tts(reply))
+                return send_voice(self.uid, tts(reply))
             except Exception as e:
                 print(f"user {self.uid} tts error:", e, flush=True)
-                send(self.uid, "🔇 ساخت صدا ناموفق بود، فقط متن فرستاده شد.")
+        send(self.uid, reply)
 
     def show_list(self):
         rows = []

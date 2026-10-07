@@ -158,7 +158,8 @@ class User:
         if not text:
             return
         call("sendChatAction", chat_id=self.uid, action="typing")
-        reply, self.current = ask(text, self.current, self.workdir, self.env())
+        reply, self.current = ask(text, self.current, self.workdir, self.env(),
+                                  TOOLS_ADMIN if self.admin else TOOLS_OTHERS)
         # spoken in -> spoken out (voice only); long replies, errors or a TTS failure -> text
         if (m.get("voice") and GEMINI_KEY and len(reply) <= TTS_MAX_CHARS
                 and not reply.startswith(("⚠️", "⏱"))):
@@ -361,9 +362,17 @@ def save_upload(m, workdir):
     return dest
 
 
-def ask(prompt, sid, workdir, env):
+# Tool access per role (tested 2026-10-07). acceptEdits = create/edit files inside the working folder.
+# Without "Bash", claude -p still runs read-only commands but only inside its working folder, so
+# friends/guest can't read ~/bot/.env or users.json. "Bash" = any command as the claude user: admin only.
+TOOLS_ADMIN = "WebSearch,WebFetch,Bash"
+TOOLS_OTHERS = "WebSearch,WebFetch"
+
+
+def ask(prompt, sid, workdir, env, tools=TOOLS_OTHERS):
     """Run claude; return (reply, session_id). sid=None starts a new session."""
-    args = [CLAUDE, "-p", prompt, "--output-format", "json"] + (["--resume", sid] if sid else [])
+    args = [CLAUDE, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
+            "--allowedTools", tools] + (["--resume", sid] if sid else [])
     try:
         p = subprocess.run(args, cwd=workdir, env=env, capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
@@ -373,6 +382,9 @@ def ask(prompt, sid, workdir, env):
     except ValueError:  # auth expiry, crash, etc.: no JSON, show raw error
         return f"⚠️ claude exited {p.returncode}:\n{(p.stderr or p.stdout)[-1500:]}", sid
     reply = d.get("result") or ""
+    denied = sorted({p.get("tool_name", "?") for p in d.get("permission_denials") or []})
+    if denied and not d.get("is_error"):
+        reply += "\n\n⛔ اجازه نداشت: " + "، ".join(denied)
     return (f"⚠️ {reply}" if d.get("is_error") else reply), d.get("session_id") or sid
 
 

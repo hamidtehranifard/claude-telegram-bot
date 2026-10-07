@@ -43,6 +43,10 @@ cd ~/bot && TG_TOKEN=x ALLOWED_ID=1 python3 test_bot.py   # prints "ok"
 
 ## Limits
 
-- `claude -p` cannot use tools that need approval (editing files, running commands), so the bot is for chat and reading files.
+- Tool access (`--permission-mode acceptEdits --allowedTools ...`):
+  - admin: web search, web fetch, **any shell command**, and file edits in the work folder.
+  - friends and guest: web search, web fetch, and file edits in their own folder. **No Bash**, so they can't read
+    `.env` or other users' tokens (tested: reads outside the working folder are blocked).
+  - Denied tools are listed under the reply (⛔).
 - Messages from one user run one at a time. Each user has their own queue.
 - Gemini free tier: Google may use the audio to improve its products.

@@ -247,12 +247,18 @@ class User:
         pid, fd = self.login
         if not code or code.startswith("/"):
             return send(self.uid, "منتظر کد ورود هستم. اگر لینک کار نکرد، /login را دوباره بزنید.")
-        os.write(fd, code.encode() + b"\r")
+        before = read_until(fd, re.compile(r"(?!x)x"), 0.3)  # never matches: just drain what's on screen
+        os.write(fd, code.encode())
+        time.sleep(1)  # let the terminal input box take the pasted code before Enter
+        os.write(fd, b"\r")
         out = read_until(fd, re.compile(r"sk-ant-oat\w*-[A-Za-z0-9_\-]{20,}"), 90)
         tok = re.search(r"sk-ant-oat\w*-[A-Za-z0-9_\-]{20,}", out)
         self.kill_login()
-        if not tok:
-            return send(self.uid, "⚠️ ورود کامل نشد (کد اشتباه یا منقضی). دوباره /login بزنید.")
+        if not tok:  # no token was issued, so the screen text is safe to show for debugging
+            tail = out[-700:] or before[-300:]
+            print(f"user {self.uid} login failed, setup-token said: {tail!r}", flush=True)
+            send(ADMIN, f"⚠️ ورود {user_label(self.uid)} کامل نشد. خروجی setup-token:\n\n{tail}")
+            return send(self.uid, "⚠️ ورود کامل نشد (کد اشتباه یا منقضی). دوباره /login بزنید و کد جدید را کامل کپی کنید.")
         with store_lock:
             f = STORE["friends"].get(str(self.uid))
             if f is None:  # removed by the admin while logging in

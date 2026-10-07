@@ -141,8 +141,8 @@ class User:
                 return send(self.uid, "⚠️ تبدیل صدا فعال نیست (کلید Gemini تنظیم نشده).")
             call("sendChatAction", chat_id=self.uid, action="typing")
             heard, model, secs = transcribe(path)
-            send(self.uid, f"🎤 شنیدم:\n{heard}\n\n({model}، {secs:.1f} ثانیه)")
-            text = heard + (f"\n\n{text}" if text else "")
+            send(self.uid, f"🎤 شنیدم:\n{heard}")
+            text = heard + (f"\n\n{text}" if text else "") + VOICE_HINT
         elif path:
             text = f"I uploaded a file: {os.path.relpath(path, self.workdir)}\n\n" + (text or "Read it and tell me briefly what it is.")
         elif cmd in ("/new", NEW_BTN):
@@ -160,6 +160,15 @@ class User:
         call("sendChatAction", chat_id=self.uid, action="typing")
         reply, self.current = ask(text, self.current, self.workdir, self.env())
         send(self.uid, reply)
+        if m.get("voice") and GEMINI_KEY and not reply.startswith(("⚠️", "⏱")):  # spoken in -> spoken out
+            if len(reply) > TTS_MAX_CHARS:
+                return send(self.uid, "🔇 جواب طولانی بود، فقط متن فرستاده شد.")
+            call("sendChatAction", chat_id=self.uid, action="record_voice")
+            try:
+                send_voice(self.uid, tts(reply))
+            except Exception as e:
+                print(f"user {self.uid} tts error:", e, flush=True)
+                send(self.uid, "🔇 ساخت صدا ناموفق بود، فقط متن فرستاده شد.")
 
     def show_list(self):
         rows = []
@@ -278,6 +287,56 @@ def transcribe(path):
         except Exception as e:
             errors.append(f"{model}: {e}")
     raise RuntimeError("تبدیل صدا به متن نشد:\n" + "\n".join(errors))
+
+
+TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"]  # both tested good for Persian
+TTS_MAX_CHARS = 1500  # longer replies stay text-only (slow to synthesize, tiring to listen to)
+VOICE_HINT = ("\n\n(The user sent this as a voice message and will hear your reply read aloud. "
+              "Answer in short, natural spoken sentences in the user's language: no markdown, tables, "
+              "lists or code unless they are essential.)")
+
+
+def tts(text):
+    """Text -> OGG/Opus bytes for Telegram sendVoice, via Gemini TTS + ffmpeg."""
+    import base64, io, wave
+    text = re.sub(r"[*_#`>|]+", " ", text)  # markdown symbols would be read aloud
+    body = json.dumps({"contents": [{"parts": [{"text": text}]}],
+                       "generationConfig": {"responseModalities": ["AUDIO"],
+                                            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Kore"}}}}}).encode()
+    errors = []
+    for model in TTS_MODELS:
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            body, {"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                part = json.load(r)["candidates"][0]["content"]["parts"][0]["inlineData"]
+            audio = base64.b64decode(part["data"])
+            if "wav" not in part["mimeType"].lower():  # raw 16-bit PCM, 24 kHz mono: add a WAV header
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(1), w.setsampwidth(2), w.setframerate(24000), w.writeframes(audio)
+                audio = buf.getvalue()
+            p = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k",
+                                "-f", "ogg", "pipe:1"], input=audio, capture_output=True, timeout=60)
+            if p.returncode == 0 and p.stdout:
+                return p.stdout
+            errors.append(f"{model}: ffmpeg {p.stderr[-200:].decode('utf-8', 'replace')}")
+        except urllib.error.HTTPError as e:
+            errors.append(f"{model}: HTTP {e.code}")
+        except Exception as e:
+            errors.append(f"{model}: {e}")
+    raise RuntimeError("; ".join(errors))
+
+
+def send_voice(chat, ogg):
+    b = os.urandom(16).hex()
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n"
+            f"--{b}\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"reply.ogg\"\r\n"
+            f"Content-Type: audio/ogg\r\n\r\n").encode() + ogg + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(API + "sendVoice", body, {"Content-Type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.load(r)["result"]
 
 
 def save_upload(m, workdir):

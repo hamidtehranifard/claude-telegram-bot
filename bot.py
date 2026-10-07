@@ -16,9 +16,12 @@ TZ = ZoneInfo("Asia/Tehran")
 
 NEW_BTN, LIST_BTN, USAGE_BTN = "🆕 گفتگوی جدید", "📋 گفتگوها", "📊 مصرف"
 ADD_BTN, GUEST_BTN, DEL_BTN = "➕ افزودن دوست", "👥 افزودن مهمان", "➖ حذف دوست"
+DEL_GUEST_BTN = "➖ حذف مهمان"
 PERM_BTN = "🔐 دسترسی‌ها"
 BASE_ROW = [{"text": NEW_BTN}, {"text": LIST_BTN}, {"text": USAGE_BTN}]
-KB_FRIEND = json.dumps({"keyboard": [BASE_ROW], "resize_keyboard": True, "is_persistent": True})
+KB_GUEST = json.dumps({"keyboard": [BASE_ROW], "resize_keyboard": True, "is_persistent": True})
+KB_FRIEND = json.dumps({"keyboard": [BASE_ROW, [{"text": GUEST_BTN}, {"text": DEL_GUEST_BTN}]],
+                        "resize_keyboard": True, "is_persistent": True})
 KB_ADMIN = json.dumps({"keyboard": [BASE_ROW, [{"text": ADD_BTN}, {"text": GUEST_BTN}, {"text": DEL_BTN}],
                                     [{"text": PERM_BTN}]],
                        "resize_keyboard": True, "is_persistent": True})
@@ -34,7 +37,7 @@ def call(method, **params):
 
 def send(chat, text, markup=None):
     text = text.strip() or "(empty reply)"
-    markup = markup or (KB_ADMIN if chat == ADMIN else KB_FRIEND)
+    markup = markup or (KB_ADMIN if chat == ADMIN else KB_FRIEND if str(chat) in STORE["friends"] else KB_GUEST)
     for i in range(0, len(text), 4000):  # Telegram limit is 4096
         call("sendMessage", chat_id=chat, text=text[i:i + 4000], reply_markup=markup)
 
@@ -47,9 +50,14 @@ store_lock = threading.RLock()  # STORE is shared by the main loop and user thre
 def load_store():
     try:
         with open(USERS_FILE) as f:
-            return json.load(f)
+            s = json.load(f)
     except FileNotFoundError:
-        return {"friends": {}, "pending": []}
+        s = {"friends": {}, "pending": []}
+    # guests: {host uid: {"name": "@x", "id": guest uid once they said hello}}; one per host (admin or friend)
+    s.setdefault("guests", {})
+    if "guest" in s:  # old format: a single guest of the admin
+        s["guests"][str(ADMIN)] = s.pop("guest")
+    return s
 
 
 STORE = load_store()
@@ -63,15 +71,26 @@ def save_store():
         os.replace(tmp, USERS_FILE)
 
 
+def guest_base(host_uid):
+    # the admin's guest keeps its original folder (~/guest), friends' guests live under ~/guests/<host>
+    return os.path.join(HOME, "guest") if host_uid == ADMIN else os.path.join(HOME, "guests", str(host_uid))
+
+
 class User:
-    def __init__(self, uid, token=None, guest=False):
+    def __init__(self, uid, token=None, host=None):
         self.uid = uid
         self.admin = uid == ADMIN
-        # guest = the one person who shares the admin's own Claude account (own folder + session list)
-        self.shared = self.admin or guest
-        base = HOME if self.admin else os.path.join(HOME, "guest" if guest else "friends/" + str(uid))
+        # host = the User whose Claude account this guest shares (own folder + session list, host's login)
+        self.host = host
+        if self.admin:
+            base = HOME
+        elif host:
+            base = guest_base(host.uid)
+        else:
+            base = os.path.join(HOME, "friends", str(uid))
         self.workdir = os.path.join(base, "work")
-        self.cfgdir = os.path.join(HOME, ".claude") if self.shared else os.path.join(base, ".claude")
+        self.cfgdir = (host.cfgdir if host else
+                       os.path.join(HOME, ".claude") if self.admin else os.path.join(base, ".claude"))
         self.token = token
         self.login = None  # (pid, fd) while `claude setup-token` waits for the code
         self.q = queue.Queue()
@@ -80,8 +99,14 @@ class User:
         self.current = latest[0][0] if latest else None  # resume where we left off after a restart
         threading.Thread(target=self.worker, daemon=True).start()
 
+    @property
+    def shared(self):  # runs on someone else's (or the admin's own) login: no /login, no token of its own
+        return self.admin or self.host is not None
+
     def env(self):
-        if self.shared:
+        if self.host:
+            return self.host.env()  # follows the host's current token
+        if self.admin:
             return None
         # separate config dir = separate history/settings; token = their own subscription
         return {**os.environ, "CLAUDE_CONFIG_DIR": self.cfgdir, "CLAUDE_CODE_OAUTH_TOKEN": self.token or ""}
@@ -141,6 +166,8 @@ class User:
             return self.finish_login(cmd)
         if not self.shared and not self.token:
             return send(self.uid, "ابتدا با /login وارد حساب Claude خود شوید.")
+        if self.host and not self.host.admin and not self.host.token:
+            return send(self.uid, "میزبان شما هنوز وارد حساب Claude نشده است.")
         path = save_upload(m, self.workdir)
         if path and m.get("voice"):
             if not GEMINI_KEY:
@@ -465,8 +492,9 @@ pending_lock = threading.Lock()
 def user_label(uid):
     if uid == ADMIN:
         return "شما"
-    if (STORE.get("guest") or {}).get("id") == uid:
-        return "مهمان " + STORE["guest"]["name"]
+    for host, g in STORE["guests"].items():
+        if g.get("id") == uid:
+            return f"مهمان {g['name']}" + ("" if int(host) == ADMIN else f" (از طرف {user_label(int(host))})")
     return (STORE["friends"].get(str(uid)) or {}).get("name", str(uid))
 
 
@@ -542,9 +570,29 @@ def main():
     users = {ADMIN: User(ADMIN)}
     for fid, f in store["friends"].items():
         users[int(fid)] = User(int(fid), f.get("token"))
-    if store.get("guest", {}).get("id"):
-        users[store["guest"]["id"]] = User(store["guest"]["id"], guest=True)
-    awaiting = None  # None | "friend" | "guest": admin was asked for a username
+    for host, g in store["guests"].items():
+        if g.get("id") and int(host) in users:
+            users[g["id"]] = User(g["id"], host=users[int(host)])
+    awaiting = {}  # uid -> "friend" | "guest": that user was asked for a username
+    all_buttons = (NEW_BTN, LIST_BTN, USAGE_BTN, ADD_BTN, GUEST_BTN, DEL_BTN, DEL_GUEST_BTN, PERM_BTN)
+
+    def drop_guest(host):
+        """Remove host's guest (pending or active), their saved rules and files. Returns the record or None."""
+        with store_lock:
+            g = store["guests"].pop(str(host), None)
+            if g and g.get("id"):
+                store.get("perms", {}).pop(str(g["id"]), None)
+            save_store()
+        if g:
+            if g.get("id"):
+                users.pop(g["id"], None)
+                try:
+                    send(g["id"], "دسترسی شما به این بات قطع شد.", json.dumps({"remove_keyboard": True}))
+                except Exception:
+                    pass
+            shutil.rmtree(guest_base(host), ignore_errors=True)
+        return g
+
     offset = 0
     while True:
         try:
@@ -557,19 +605,16 @@ def main():
                     call("answerCallbackQuery", callback_query_id=q["id"])
                     if uid in users and data.startswith("s:"):
                         users[uid].q.put(("pick", data[2:]))
-                    elif uid == ADMIN and data == "g:":
-                        with store_lock:
-                            g = store.pop("guest", None)
-                            if g and g.get("id"):
-                                store.get("perms", {}).pop(str(g["id"]), None)
-                            save_store()
-                        if g and g.get("id"):
-                            users.pop(g["id"], None)
-                            shutil.rmtree(os.path.join(HOME, "guest"), ignore_errors=True)
+                    elif uid == ADMIN and data.startswith("g:"):  # remove a guest ("g:<host>"; bare "g:" = admin's)
+                        host = int(data[2:] or ADMIN)
+                        g = drop_guest(host)
                         if g:
                             send(ADMIN, f"🗑 دسترسی مهمان {g.get('name', '')} قطع شد و فایل‌هایش پاک شد.")
+                            if host != ADMIN and host in users:
+                                send(host, f"ادمین مهمان شما ({g.get('name', '')}) را حذف کرد.")
                     elif uid == ADMIN and data.startswith("d:"):
                         fid = data[2:]
+                        g = drop_guest(int(fid))  # a friend's guest goes with them
                         with store_lock:
                             f = store["friends"].pop(fid, None)
                             store.get("perms", {}).pop(fid, None)
@@ -579,7 +624,8 @@ def main():
                             if gone:
                                 gone.kill_login()
                             shutil.rmtree(os.path.join(HOME, "friends", fid), ignore_errors=True)
-                            send(ADMIN, f"🗑 {f.get('name', fid)} حذف شد و توکن و فایل‌هایش پاک شد.")
+                            send(ADMIN, f"🗑 {f.get('name', fid)} حذف شد و توکن و فایل‌هایش پاک شد."
+                                 + (f" مهمانش {g.get('name', '')} هم حذف شد." if g else ""))
                     elif uid == ADMIN and data[:3] in ("p1:", "pA:", "pN:"):  # approval card
                         with pending_lock:
                             req = PENDING.pop(data[3:], None)
@@ -617,20 +663,35 @@ def main():
                     continue  # private chats only, so chat id == user id
                 cmd = (m.get("text") or "").strip()
 
+                is_host = uid == ADMIN or str(uid) in store["friends"]  # admin and friends may host one guest
+                if is_host and cmd in ("/guest", GUEST_BTN):
+                    awaiting.pop(uid, None)
+                    g = store["guests"].get(str(uid))
+                    if uid != ADMIN and not users[uid].token:
+                        send(uid, "اول با /login وارد حساب Claude خودتان شوید.")
+                    elif g:
+                        send(uid, f"⚠️ فقط یک مهمان مجاز است و {g['name']} ثبت شده. اول با "
+                                  f"«{DEL_BTN if uid == ADMIN else DEL_GUEST_BTN}» او را حذف کنید.")
+                    else:
+                        awaiting[uid] = "guest"
+                        send(uid, "یوزرنیم تلگرام مهمان را بفرستید (مثلاً @ali).\n⚠️ او با حساب Claude شما کار می‌کند "
+                                  "و از سهمیه‌ی شما مصرف می‌کند. شرایط استفاده‌ی Anthropic اشتراک‌گذاری حساب را مجاز نمی‌داند.")
+                    continue
+                if is_host and uid != ADMIN and cmd in ("/delguest", DEL_GUEST_BTN):
+                    awaiting.pop(uid, None)
+                    g = drop_guest(uid)
+                    send(uid, f"🗑 مهمان {g['name']} حذف شد و فایل‌هایش پاک شد." if g else "مهمانی ثبت نشده.")
+                    if g:
+                        send(ADMIN, f"🗑 {user_label(uid)} مهمانش {g['name']} را حذف کرد.")
+                    continue
+
                 if uid == ADMIN:
                     if cmd in ("/add", ADD_BTN):
-                        awaiting = "friend"
+                        awaiting[uid] = "friend"
                         send(ADMIN, "یوزرنیم تلگرام دوستتان را بفرستید (مثلاً @ali).\nاو با حساب Claude خودش وارد می‌شود.")
                         continue
-                    if cmd in ("/guest", GUEST_BTN):
-                        if store.get("guest"):
-                            send(ADMIN, f"⚠️ فقط یک مهمان مجاز است و {store['guest']['name']} ثبت شده. اول با «{DEL_BTN}» او را حذف کنید.")
-                            continue
-                        awaiting = "guest"
-                        send(ADMIN, "یوزرنیم تلگرام مهمان را بفرستید (مثلاً @ali).\n⚠️ او با حساب Claude شما کار می‌کند و از سهمیه‌ی شما مصرف می‌کند.")
-                        continue
                     if cmd in ("/perms", PERM_BTN):
-                        awaiting = None
+                        awaiting.pop(uid, None)
                         rows = [[{"text": f"❌ {user_label(int(ruid))}: {rule}", "callback_data": f"pr:{ruid}:{i}:{rule[:30]}"}]
                                 for ruid, rules in store.get("perms", {}).items() for i, rule in enumerate(rules)]
                         base = ("دسترسی پایه:\n• شما: جست‌وجو، خواندن وب، هر دستور شل، ویرایش فایل در پوشه‌ی کاری\n"
@@ -641,29 +702,14 @@ def main():
                         else:
                             send(ADMIN, base + "\n\nهنوز قاعده‌ی «همیشه» ثبت نشده.")
                         continue
-                    if awaiting and cmd and (cmd.startswith("/") or cmd in (NEW_BTN, LIST_BTN, USAGE_BTN, DEL_BTN, GUEST_BTN, ADD_BTN)):
-                        awaiting = None  # admin moved on: cancel, handle the command normally
-                    elif awaiting and cmd:
-                        kind, awaiting = awaiting, None
-                        name = cmd.lstrip("@").lower()
-                        if not re.fullmatch(r"[a-z0-9_]{4,32}", name):
-                            send(ADMIN, "⚠️ یوزرنیم معتبر نیست. دوباره دکمه‌ی افزودن را بزنید.")
-                            continue
-                        with store_lock:
-                            if kind == "guest":
-                                store["guest"] = {"name": "@" + name}
-                            elif name not in store["pending"]:
-                                store["pending"].append(name)
-                            save_store()
-                        send(ADMIN, f"✅ @{name} در انتظار است. از او بخواهید به @{call('getMe')['username']} پیام /start بدهد.")
-                        continue
                     if cmd in ("/remove", DEL_BTN):
+                        awaiting.pop(uid, None)
                         rows = [[{"text": f.get("name", fid), "callback_data": "d:" + fid}]
                                 for fid, f in store["friends"].items()]
-                        if store.get("guest"):
-                            g = store["guest"]
-                            rows.append([{"text": f"👥 مهمان: {g['name']}" + ("" if g.get("id") else " (در انتظار)"),
-                                          "callback_data": "g:"}])
+                        for host, g in store["guests"].items():
+                            owner = "" if int(host) == ADMIN else f" (از طرف {user_label(int(host))})"
+                            rows.append([{"text": f"👥 مهمان: {g['name']}{owner}" + ("" if g.get("id") else " (در انتظار)"),
+                                          "callback_data": "g:" + host}])
                         pend = "، ".join("@" + p for p in store["pending"])
                         if pend:
                             with store_lock:
@@ -676,15 +722,40 @@ def main():
                             send(ADMIN, "دوستی ثبت نشده.")
                         continue
 
+                # a host (admin or friend) was asked for a username and this message is the answer
+                if uid in awaiting and cmd:
+                    if cmd.startswith("/") or cmd in all_buttons:
+                        awaiting.pop(uid)  # moved on: cancel, handle the command normally
+                    else:
+                        kind = awaiting.pop(uid)
+                        name = cmd.lstrip("@").lower()
+                        if not re.fullmatch(r"[a-z0-9_]{4,32}", name):
+                            send(uid, "⚠️ یوزرنیم معتبر نیست. دوباره دکمه‌ی افزودن را بزنید.")
+                            continue
+                        with store_lock:
+                            if kind == "guest":
+                                store["guests"][str(uid)] = {"name": "@" + name}
+                            elif name not in store["pending"]:
+                                store["pending"].append(name)
+                            save_store()
+                        send(uid, f"✅ @{name} در انتظار است. از او بخواهید به @{call('getMe')['username']} پیام /start بدهد.")
+                        if uid != ADMIN:
+                            send(ADMIN, f"👥 {user_label(uid)} مهمان @{name} را دعوت کرد (روی حساب Claude خودش).")
+                        continue
+
                 if uid not in users:
                     name = (frm.get("username") or "").lower()
-                    g = store.get("guest") or {}
-                    if name and not g.get("id") and g.get("name") == "@" + name:  # invited guest says hello
+                    host = next((int(h) for h, g in store["guests"].items()
+                                 if not g.get("id") and g.get("name") == "@" + name), None) if name else None
+                    if host is not None and host in users:  # invited guest says hello
                         with store_lock:
-                            g["id"] = uid
+                            store["guests"][str(host)]["id"] = uid
                             save_store()
-                        users[uid] = User(uid, guest=True)
-                        send(ADMIN, f"👥 مهمان @{name} فعال شد و با حساب شما کار می‌کند.")
+                        users[uid] = User(uid, host=users[host])
+                        whose = "شما" if host == ADMIN else user_label(host)
+                        send(ADMIN, f"👥 مهمان @{name} فعال شد و با حساب Claude {whose} کار می‌کند.")
+                        if host != ADMIN:
+                            send(host, f"👥 مهمان شما @{name} فعال شد.")
                         send(uid, "👋 خوش آمدید. پیام یا فایل بفرستید تا Claude جواب بدهد.")
                         continue
                     if name and name in store["pending"]:  # invited friend says hello: register + login
@@ -697,8 +768,11 @@ def main():
                         users[uid].q.put(("login", None))
                     continue  # strangers are ignored silently
 
-                if cmd == "/login" and not users[uid].shared:  # admin/guest use the admin's login
-                    users[uid].q.put(("login", None))
+                if cmd == "/login":
+                    if users[uid].shared:  # admin and guests run on an existing login
+                        send(uid, "ورود لازم نیست؛ شما با حساب Claude " + ("خودتان" if uid == ADMIN else "میزبانتان") + " کار می‌کنید.")
+                    else:
+                        users[uid].q.put(("login", None))
                     continue
                 users[uid].q.put(("msg", m))
         except Exception as e:  # network blips: wait and keep polling

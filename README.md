@@ -14,7 +14,9 @@ Single file, **Python standard library only** (no pip packages).
 - 🔊 Voice in, voice out: a voice message gets a voice reply only (Gemini TTS, Opus via `ffmpeg`); long replies (>1500 chars) come as text.
 - Multi-user, admin only:
   - ➕ **Friend**: logs in with *their own* Claude subscription. The bot runs `claude setup-token` in a pty, sends them the login link, and takes the code back. Separate config dir, history, and queue.
-  - 👥 **Guest** (max 1): uses the admin's account, in a separate folder. ⚠️ Sharing an account goes against Anthropic's consumer terms, so use it at your own risk.
+  - 👥 **Guest**: the admin and each logged-in friend can host **one** guest on *their own* account
+    (separate folder and session list, host's login). The admin is notified and can remove any guest.
+    ⚠️ Sharing an account goes against Anthropic's consumer terms, so use it at your own risk.
   - ➖ Remove: revokes access and deletes that user's files and token.
 - Long polling: no webhook and no open ports.
 

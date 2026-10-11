@@ -17,6 +17,8 @@ assert "ساعت ۰۰:۰۰" in bot.fa_usage_line("Current session: 1% used · re
 dec = datetime(2026, 12, 30, tzinfo=bot.TZ)  # January reset seen in December -> next year
 assert "۱۲ دی ۱۴۰۵" in bot.fa_usage_line("Current week (all models): 1% used · resets Jan 2, 8am (x)", dec)
 assert bot.fa_usage_line("something else", now) == "something else"
+# the "what's contributing" breakdown lines say "usage", not "% used · resets": they must not count as limit lines
+assert not bot.USAGE_RE.match("99% of your usage was at >150k context")
 
 # pty output: ANSI codes stripped, wrapped URL/token re-joined
 raw = b"\x1b[1mhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c\r\n250a&state=abc\x1b[0m\r\n\r\nPaste code here >"

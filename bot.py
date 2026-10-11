@@ -551,8 +551,13 @@ def usage(env=None):
     except subprocess.TimeoutExpired:
         return "⏱ گزارش مصرف در ۲ دقیقه نیامد."
     now = datetime.now(TZ)
-    lines = [fa_usage_line(l, now) for l in (p.stdout or p.stderr).splitlines() if "used" in l or "resets" in l]
-    return "📊 مصرف اشتراک (به وقت تهران)\n\n" + ("\n\n".join(lines) or (p.stdout or p.stderr)[-1500:])
+    raw = p.stdout or p.stderr
+    lines = [fa_usage_line(l, now) for l in raw.splitlines() if USAGE_RE.match(l.strip())]
+    if lines:
+        return "📊 مصرف اشتراک (به وقت تهران)\n\n" + "\n\n".join(lines)
+    # Claude Code sometimes omits the limit bars and prints only a "what's contributing" breakdown
+    return ("📊 Claude Code این بار درصد مصرف ۵ ساعته و هفتگی را گزارش نکرد.\n"
+            "درصد دقیق را در claude.ai ← Settings ← Usage ببینید. خروجی خود Claude Code:\n\n" + raw[:1500])
 
 
 # ---------- main loop: routing + admin actions ----------

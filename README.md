@@ -10,6 +10,9 @@ Single file, **Python standard library only** (no pip packages).
 - Chat with Claude; conversations continue (`--resume <session_id>`).
 - 🆕 New conversation · 📋 list and pick earlier conversations · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
 - File and photo upload (≤ 20 MB, a Telegram bot limit): Claude reads them from `work/uploads/`.
+- 📤 "Send me the file": the `send-file` skill (`skills/send-file/SKILL.md`, copied into every user's
+  Claude config dir at startup) makes Claude answer with `[[SEND_FILE: path]]`; the bot strips the marker
+  and uploads the file (≤ 50 MB). Friends and guests can only send files from their own work folder.
 - 🎤 Voice messages: Persian speech-to-text with Google Gemini (free tier), then sent to Claude.
 - 🔊 Voice in, voice out: a voice message gets a voice reply only (Gemini TTS, Opus via `ffmpeg`); long replies (>1500 chars) come as text.
 - Multi-user, admin only:
@@ -26,7 +29,7 @@ Single file, **Python standard library only** (no pip packages).
 # as a non-root user "claude"
 curl -fsSL https://claude.ai/install.sh | bash   # (root: apt install ffmpeg, for voice replies)
 claude            # log in once with your subscription (not an API key)
-mkdir -p ~/bot && cp bot.py test_bot.py ~/bot/
+mkdir -p ~/bot && cp -r bot.py test_bot.py skills ~/bot/
 cp .env.example ~/bot/.env && chmod 600 ~/bot/.env   # fill in the values
 
 # as root

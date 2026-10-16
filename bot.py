@@ -13,6 +13,10 @@ CLAUDE = os.path.expanduser("~/.local/bin/claude")
 HOME = os.path.expanduser("~")
 USERS_FILE = os.path.join(HOME, "bot", "users.json")
 TZ = ZoneInfo("Asia/Tehran")
+# "send me the file": this skill teaches Claude to answer with [[SEND_FILE: path]]; the bot uploads it
+SKILL_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "send-file", "SKILL.md")
+SEND_RE = re.compile(r"\[\[SEND_FILE:\s*(.+?)\s*\]\]")
+SEND_MAX = 50 * 1024 * 1024  # Telegram bot upload limit
 
 NEW_BTN, LIST_BTN, USAGE_BTN = "🆕 گفتگوی جدید", "📋 گفتگوها", "📊 مصرف"
 ADD_BTN, GUEST_BTN, DEL_BTN = "➕ افزودن دوست", "👥 افزودن مهمان", "➖ حذف دوست"
@@ -95,6 +99,7 @@ class User:
         self.login = None  # (pid, fd) while `claude setup-token` waits for the code
         self.q = queue.Queue()
         os.makedirs(self.workdir, exist_ok=True)
+        install_skill(self.cfgdir)
         latest = self.sessions(1)
         self.current = latest[0][0] if latest else None  # resume where we left off after a restart
         threading.Thread(target=self.worker, daemon=True).start()
@@ -196,16 +201,29 @@ class User:
         call("sendChatAction", chat_id=self.uid, action="typing")
         tools = (TOOLS_ADMIN if self.admin else TOOLS_OTHERS) + saved_rules(self.uid) + list(extra)
         reply, self.current, denials = ask(text, self.current, self.workdir, self.env(), tools)
+        reply, files, errors = outgoing_files(reply, self.workdir, self.admin)
         rules = denial_rules(denials)
+        spoken = False
         # spoken in -> spoken out (voice only); long replies, errors, permission requests or a TTS failure -> text
-        if (voice and GEMINI_KEY and not rules and len(reply) <= TTS_MAX_CHARS
+        if (voice and GEMINI_KEY and reply and not rules and len(reply) <= TTS_MAX_CHARS
                 and not reply.startswith(("⚠️", "⏱"))):
             call("sendChatAction", chat_id=self.uid, action="record_voice")
             try:
-                return send_voice(self.uid, tts(reply))
+                send_voice(self.uid, tts(reply))
+                spoken = True
             except Exception as e:
                 print(f"user {self.uid} tts error:", e, flush=True)
-        send(self.uid, reply)
+        if not spoken and (reply or not files):
+            send(self.uid, reply)
+        for path in files:
+            call("sendChatAction", chat_id=self.uid, action="upload_document")
+            try:
+                with open(path, "rb") as f:
+                    upload("sendDocument", "document", self.uid, os.path.basename(path), f.read())
+            except Exception as e:
+                errors.append(f"⚠️ {os.path.basename(path)}: ارسال نشد ({e})")
+        if errors:
+            send(self.uid, "\n".join(errors))
         if rules:
             self.request(rules)
 
@@ -404,14 +422,44 @@ def tts(text):
     raise RuntimeError("; ".join(errors))
 
 
-def send_voice(chat, ogg):
+def upload(method, field, chat, name, data, ctype="application/octet-stream"):
+    """Multipart upload (sendVoice / sendDocument)."""
     b = os.urandom(16).hex()
+    name = re.sub(r'["\r\n]', "", name)  # it goes inside a quoted header
     body = (f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat}\r\n"
-            f"--{b}\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"reply.ogg\"\r\n"
-            f"Content-Type: audio/ogg\r\n\r\n").encode() + ogg + f"\r\n--{b}--\r\n".encode()
-    req = urllib.request.Request(API + "sendVoice", body, {"Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=120) as r:
+            f"--{b}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n"
+            f"Content-Type: {ctype}\r\n\r\n").encode() + data + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(API + method, body, {"Content-Type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)["result"]
+
+
+def send_voice(chat, ogg):
+    return upload("sendVoice", "voice", chat, "reply.ogg", ogg, "audio/ogg")
+
+
+def install_skill(cfgdir):
+    """Every Claude config dir (admin, each friend; guests share their host's) gets the send-file skill."""
+    dest = os.path.join(cfgdir, "skills", "send-file", "SKILL.md")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copyfile(SKILL_SRC, dest)
+
+
+def outgoing_files(reply, workdir, admin):
+    """Pull [[SEND_FILE: path]] markers out of Claude's reply -> (reply text, paths to upload, error lines).
+    Friends and guests may only send files inside their own work folder (realpath: no symlink or ../ escapes)."""
+    root, paths, errors = os.path.realpath(workdir), [], []
+    for p in dict.fromkeys(SEND_RE.findall(reply)):
+        full = os.path.realpath(os.path.join(workdir, os.path.expanduser(p)))
+        if not admin and os.path.commonpath([root, full]) != root:
+            errors.append(f"⛔ {p}: فقط فایل‌های پوشه‌ی خودتان فرستاده می‌شوند.")
+        elif not os.path.isfile(full):
+            errors.append(f"⚠️ {p}: فایل پیدا نشد.")
+        elif os.path.getsize(full) > SEND_MAX:
+            errors.append(f"⚠️ {p}: بیشتر از ۵۰ مگابایت است و تلگرام اجازه‌ی ارسال نمی‌دهد.")
+        else:
+            paths.append(full)
+    return SEND_RE.sub("", reply).strip(), paths, errors
 
 
 def save_upload(m, workdir):

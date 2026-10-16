@@ -35,4 +35,21 @@ rules = dict(bot.denial_rules([
 ]))
 assert set(rules) == {"Bash(cd:*)", "Bash(curl:*)", "Bash(jq:*)", "Bash(wget:*)", "Write"}, rules
 assert "/etc/hosts" in rules["Write"]
+
+# [[SEND_FILE: ...]] markers: friends/guests only from their own work folder, no symlink escapes
+import os, tempfile
+with tempfile.TemporaryDirectory() as tmp:
+    work, secret = os.path.join(tmp, "work"), os.path.join(tmp, ".env")
+    os.makedirs(work)
+    open(os.path.join(work, "گزارش.docx"), "w").close()
+    open(secret, "w").close()
+    os.symlink(secret, os.path.join(work, "link"))
+    reply = ("فایل را فرستادم.\n[[SEND_FILE: گزارش.docx]]\n[[SEND_FILE: ../.env]]\n"
+             "[[SEND_FILE: link]]\n[[SEND_FILE: nope.txt]]")
+    text, paths, errors = bot.outgoing_files(reply, work, admin=False)
+    assert text == "فایل را فرستادم.", text
+    assert paths == [os.path.realpath(os.path.join(work, "گزارش.docx"))], paths
+    assert len(errors) == 3 and sum("⛔" in e for e in errors) == 2, errors
+    _, paths, _ = bot.outgoing_files("[[SEND_FILE: ../.env]]", work, admin=True)  # admin: anything
+    assert paths == [os.path.realpath(secret)]
 print("ok")

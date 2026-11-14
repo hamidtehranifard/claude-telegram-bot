@@ -8,7 +8,7 @@ Single file, **Python standard library only** (no pip packages).
 ## Features
 
 - Chat with Claude; conversations continue (`--resume <session_id>`).
-- 🆕 New conversation · 📋 list and pick earlier conversations · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
+- 🆕 New conversation · 📋 list and pick earlier conversations (10 per page, with older/newer buttons) · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
 - File and photo upload (≤ 20 MB, a Telegram bot limit): Claude reads them from `work/uploads/`.
 - 📤 "Send me the file": the `send-file` skill (`skills/send-file/SKILL.md`, copied into every user's
   Claude config dir at startup) makes Claude answer with `[[SEND_FILE: path]]`; the bot strips the marker

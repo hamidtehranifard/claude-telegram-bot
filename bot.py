@@ -14,6 +14,7 @@ HOME = os.path.expanduser("~")
 USERS_FILE = os.path.join(HOME, "bot", "users.json")
 TZ = ZoneInfo("Asia/Tehran")
 
+PAGE = 10  # conversations per page of the 📋 list
 NEW_BTN, LIST_BTN, USAGE_BTN = "🆕 گفتگوی جدید", "📋 گفتگوها", "📊 مصرف"
 ADD_BTN, GUEST_BTN, DEL_BTN = "➕ افزودن دوست", "👥 افزودن مهمان", "➖ حذف دوست"
 DEL_GUEST_BTN = "➖ حذف مهمان"
@@ -111,12 +112,12 @@ class User:
         # separate config dir = separate history/settings; token = their own subscription
         return {**os.environ, "CLAUDE_CONFIG_DIR": self.cfgdir, "CLAUDE_CODE_OAUTH_TOKEN": self.token or ""}
 
-    def sessions(self, limit=10):
+    def sessions(self, limit=PAGE, offset=0):
         """Newest-first [(session_id, mtime, first user message)]."""
         d = os.path.join(self.cfgdir, "projects", re.sub(r"[^A-Za-z0-9]", "-", self.workdir))
         files = sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
         out = []
-        for path in files[:limit]:
+        for path in files[offset:offset + limit]:
             title = "(empty)"
             with open(path, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
@@ -146,13 +147,15 @@ class User:
 
     def handle(self, kind, payload):
         if kind == "pick":
-            known = {s[0]: s[2] for s in self.sessions(50)}
+            known = {s[0]: s[2] for s in self.sessions(100000)}  # any page of the list, however old
             if payload in known:
                 self.current = payload
                 send(self.uid, f"✅ ادامه‌ی گفتگو: {known[payload][:80]}")
             else:
                 send(self.uid, "⚠️ این گفتگو پیدا نشد.")
             return
+        if kind == "page":
+            return self.show_list(*payload)
         if kind == "login":
             return self.start_login()
         if kind == "approve":
@@ -239,15 +242,29 @@ class User:
         self.run(f"The user has now approved the previously blocked action(s): {descs}. "
                  "Retry them and finish the original task.", extra=rules)
 
-    def show_list(self):
+    def show_list(self, page=0, edit=None):
+        """One page of conversations, newest first. edit = id of the list message to replace (paging buttons)."""
+        found = self.sessions(PAGE + 1, page * PAGE)  # one extra tells whether an older page exists
+        if not found and page:
+            page, found = 0, self.sessions(PAGE + 1)
         rows = []
-        for sid, mtime, title in self.sessions():
+        for sid, mtime, title in found[:PAGE]:
             when = datetime.fromtimestamp(mtime, TZ).strftime("%m/%d %H:%M")
             mark = "✅ " if sid == self.current else ""
             rows.append([{"text": f"{mark}{when} · {title[:40]}", "callback_data": "s:" + sid}])
         if not rows:
             return send(self.uid, "هنوز گفتگویی نیست.")
-        send(self.uid, "یک گفتگو را انتخاب کنید:", json.dumps({"inline_keyboard": rows}))
+        nav = [{"text": "⬆️ جدیدترها", "callback_data": f"l:{page - 1}"}] if page else []
+        if len(found) > PAGE:
+            nav.append({"text": "⬇️ قدیمی‌ترها", "callback_data": f"l:{page + 1}"})
+        text = "یک گفتگو را انتخاب کنید:" + (f" (صفحه‌ی {page + 1})".translate(FA_DIGITS) if nav else "")
+        markup = json.dumps({"inline_keyboard": rows + ([nav] if nav else [])})
+        if edit:
+            try:
+                return call("editMessageText", chat_id=self.uid, message_id=edit, text=text, reply_markup=markup)
+            except Exception:
+                pass  # the message is too old to edit: send a new list
+        send(self.uid, text, markup)
 
     # ---------- login via `claude setup-token` in a pseudo-terminal ----------
 
@@ -610,6 +627,8 @@ def main():
                     call("answerCallbackQuery", callback_query_id=q["id"])
                     if uid in users and data.startswith("s:"):
                         users[uid].q.put(("pick", data[2:]))
+                    elif uid in users and data.startswith("l:") and data[2:].isdigit():  # another page of the list
+                        users[uid].q.put(("page", (int(data[2:]), (q.get("message") or {}).get("message_id"))))
                     elif uid == ADMIN and data.startswith("g:"):  # remove a guest ("g:<host>"; bare "g:" = admin's)
                         host = int(data[2:] or ADMIN)
                         g = drop_guest(host)

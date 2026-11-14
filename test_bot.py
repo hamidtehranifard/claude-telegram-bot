@@ -35,4 +35,33 @@ rules = dict(bot.denial_rules([
 ]))
 assert set(rules) == {"Bash(cd:*)", "Bash(curl:*)", "Bash(jq:*)", "Bash(wget:*)", "Write"}, rules
 assert "/etc/hosts" in rules["Write"]
+# 📋 list: 10 per page, with buttons to older and newer pages; any conversation can be picked
+import json as _json, os as _os, tempfile as _tempfile
+with _tempfile.TemporaryDirectory() as _tmp:
+    _d = _os.path.join(_tmp, "projects", "-p")
+    _os.makedirs(_d)
+    for _i in range(23):
+        _f = _os.path.join(_d, f"p{_i:02d}.jsonl")
+        with open(_f, "w") as _fh:
+            _fh.write(_json.dumps({"type": "user", "message": {"content": f"chat {_i}"}}) + "\n")
+        _os.utime(_f, (1000 + _i, 1000 + _i))
+    _user = bot.User.__new__(bot.User)
+    _user.uid, _user.cfgdir, _user.workdir, _user.current = 7, _tmp, "/p", "p12"
+    _sent = []
+    bot.call = lambda method, **p: _sent.append((method, p))
+
+    def _page(n, edit=None):
+        _sent.clear()
+        _user.show_list(n, edit)
+        method, p = _sent[-1]
+        rows = _json.loads(p["reply_markup"])["inline_keyboard"]
+        return method, [b["callback_data"] for r in rows for b in r], rows
+    _method, _data, _rows = _page(0)
+    assert _method == "sendMessage" and _data == [f"s:p{i:02d}" for i in range(22, 12, -1)] + ["l:1"], _data
+    _method, _data, _rows = _page(1, edit=55)
+    assert _method == "editMessageText" and _sent[-1][1]["message_id"] == 55 and _data[-2:] == ["l:0", "l:2"], _data
+    assert _rows[0][0]["text"].startswith("✅ ") and _data[0] == "s:p12"
+    assert _page(2)[1] == ["s:p02", "s:p01", "s:p00", "l:1"] and _page(9)[1][-1] == "l:1"  # past the end -> first page
+    _user.handle("pick", "p00")
+    assert _user.current == "p00"
 print("ok")

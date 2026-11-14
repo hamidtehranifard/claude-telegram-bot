@@ -8,7 +8,7 @@ Single file, **Python standard library only** (no pip packages).
 ## Features
 
 - Chat with Claude; conversations continue (`--resume <session_id>`).
-- 🆕 New conversation · 📋 list and pick earlier conversations · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
+- 🆕 New conversation · 📋 list and pick earlier conversations (10 per page, with older/newer buttons) · 📊 5-hour and weekly usage (Tehran time, Jalali dates)
 - File and photo upload (≤ 20 MB, a Telegram bot limit): Claude reads them from `work/uploads/`.
 - 🎤 Voice messages: Persian speech-to-text with Google Gemini (free tier), then sent to Claude.
 - 🔊 Voice in, voice out: a voice message gets a voice reply only (Gemini TTS, Opus via `ffmpeg`); long replies (>1500 chars) come as text.
